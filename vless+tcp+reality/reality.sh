@@ -1,127 +1,103 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
-echo "=============================================="
-echo "     VLESS + TCP + Reality 一键部署脚本"
-echo "       优化修复版（端口不再固定、无 -1）"
-echo "=============================================="
+echo "============================================"
+echo "      Xray VLESS TCP Reality 一键部署"
+echo "============================================"
 
-# =============================
-# 生成随机 UUID
-# =============================
+# 部署目录
+XRAY_DIR="/etc/xray"
+mkdir -p $XRAY_DIR
+cd $XRAY_DIR
+
+echo "下载 Xray-core v1.8.23 ..."
+curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v1.8.23/Xray-linux-64.zip" --fail --connect-timeout 15
+unzip -o xray.zip
+chmod +x xray
+rm -f xray.zip
+
+# 生成 UUID
 UUID=$(cat /proc/sys/kernel/random/uuid)
 
-# =============================
-# 生成随机端口（避开 1–29999）
-# =============================
-get_random_port() {
-    while true; do
-        PORT=$(shuf -i 30000-60000 -n 1)
-        ss -tulpn | grep -q ":$PORT " || break
-    done
-    echo "$PORT"
-}
-PORT=$(get_random_port)
+# Reality 默认端口
+PORT=443
 
-echo "已选择随机端口: $PORT"
-echo "UUID: $UUID"
+# 生成 Reality 密钥
+echo "生成 Reality 私钥/公钥 ..."
+KEY_OUTPUT=$(./xray x25519)
+PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep Private | awk '{print $3}')
+PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep Public | awk '{print $3}')
 
-# =============================
-# 下载最新 Xray
-# =============================
-if [[ ! -f "./xray" ]]; then
-    echo "正在下载 Xray 最新版本..."
-    URL=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest |
-          grep browser_download_url | grep linux-64.zip | cut -d\" -f4)
+# 设置回落 website
+FALLBACK_DOMAIN="www.microsoft.com"
 
-    curl -L -o xray.zip "$URL"
-    unzip -j xray.zip xray -d .
-    rm -f xray.zip
-    chmod +x xray
-fi
-
-# =============================
-# 生成 Reality Keys（正确格式）
-# =============================
-KEYS=$(./xray x25519)
-PRIV=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
-PUB=$(echo "$KEYS"  | grep PublicKey  | awk '{print $2}')
-SHORT_ID=$(openssl rand -hex 8)
-MASQ="www.cloudflare.com"
-
-echo "Reality PublicKey: $PUB"
-echo "Reality ShortId: $SHORT_ID"
-
-# =============================
-# 写入 Xray 配置
-# =============================
-cat > reality.json <<EOF
+# Reality 配置文件
+cat > config.json <<EOF
 {
-  "log": { "loglevel": "warning" },
-  "inbounds": [{
-    "port": $PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{
-        "id": "$UUID",
-        "flow": "xtls-rprx-vision"
-      }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "dest": "$MASQ:443",
-        "serverNames": ["$MASQ"],
-        "privateKey": "$PRIV",
-        "publicKey": "$PUB",
-        "shortIds": ["$SHORT_ID"],
-        "fingerprint": "chrome",
-        "spiderX": "/"
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": $PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$FALLBACK_DOMAIN:443",
+          "xver": 0,
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": ["6a96"]
+        }
       }
     }
-  }],
-  "outbounds": [{ "protocol": "freedom" }]
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ]
 }
 EOF
 
-# =============================
-# 防火墙放行端口
-# =============================
-if command -v firewall-cmd >/dev/null 2>&1; then
-    echo "检测到 firewalld，放行端口..."
-    firewall-cmd --add-port=$PORT/tcp --permanent || true
-    firewall-cmd --reload || true
-elif command -v ufw >/dev/null 2>&1; then
-    echo "检测到 ufw，放行端口..."
-    ufw allow $PORT/tcp || true
-fi
+# 创建 systemd 服务
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target nss-lookup.target
 
-# =============================
-# 结束旧进程 & 后台运行
-# =============================
-pkill -f "xray run" >/dev/null 2>&1 || true
+[Service]
+Type=simple
+ExecStart=$XRAY_DIR/xray run -config $XRAY_DIR/config.json
+Restart=on-failure
 
-echo "启动 Xray Reality 服务..."
-nohup ./xray run -c reality.json >/dev/null 2>&1 &
+[Install]
+WantedBy=multi-user.target
+EOF
 
-sleep 1
+systemctl daemon-reload
+systemctl enable xray
+systemctl restart xray
 
-# =============================
-# 获取出口 IP
-# =============================
-IP=$(curl -s https://api64.ipify.org || echo "服务器IP获取失败")
-
-# =============================
-# 输出节点链接
-# =============================
-echo ""
-echo "============== Reality 节点 =============="
-LINK="vless://$UUID@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$MASQ&fp=chrome&pbk=$PUB&sid=$SHORT_ID&type=tcp&spx=/#Reality-Vision"
-
-echo "$LINK"
-echo "========================================="
-echo "部署完成！Reality 不需要反代 / CF 代理（需关闭）"
-
+echo
+echo "================ 部署完成 ================"
+echo "Reality 公钥：$PUBLIC_KEY"
+echo "Reality 私钥：$PRIVATE_KEY"
+echo
+echo "VLESS Reality 节点如下："
+echo
+echo "vless://$UUID@$(hostname -I | awk '{print $1}'):$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&pbk=$PUBLIC_KEY&fp=chrome&sid=6a96&sni=$FALLBACK_DOMAIN&type=tcp#Reality"
+echo
+echo "=========================================="
+echo "节点已生成，可直接导入客户端使用"
